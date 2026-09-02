@@ -52,7 +52,7 @@ enum CarpStatus: string {
  */
 final class SettingsDTO
 {
-    public readonly string $wanInterfaceKey, $tunnelInterfaceKey, $wanMode, $wanGatewayName;
+    public readonly string $wanInterfaceKey, $tunnelInterfaceKey, $wanMode, $wanGatewayName, $standbyGatewayIp;
     public readonly ?string $wanIpv4, $tunnelGatewayName, $localHealthCheckTarget;
     public readonly ?int $wanSubnetV4;
     public readonly array $healthCheckTargetsV4, $healthCheckTargetsV6, $coreServices, $standardServices;
@@ -70,11 +70,18 @@ final class SettingsDTO
         $this->wanInterfaceKey = $config['interfaces']['wan_key'] ?? throw new HAConfigurationException("interfaces.wan_key is required.");
         if (!preg_match('/^[a-zA-Z0-9_]+$/', $this->wanInterfaceKey)) throw new HAConfigurationException("interfaces.wan_key contains invalid characters.");
         $this->tunnelInterfaceKey = isset($config['interfaces']['tunnel_key']) ? (string)$config['interfaces']['tunnel_key'] : '';
-
+        
         // Network Validation
         $network = $config['network'] ?? [];
+        
         $this->wanMode = $network['wan_mode'] ?? 'static';
         if (!in_array($this->wanMode, ['static', 'dhcp'])) throw new HAConfigurationException("network.wan_mode must be 'static' or 'dhcp'.");
+        if (!empty($network['standby_gateway_ip'])) {
+            $this->standbyGatewayIp = filter_var($network['standby_gateway_ip'], FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)
+                ?: throw new HAConfigurationException("network.standby_gateway_ip must be a valid IPv4 address if provided.");
+        } else {
+            $this->standbyGatewayIp = '';
+        }
         if ($this->wanMode === 'static') {
             $this->wanIpv4 = filter_var($network['wan_ipv4'] ?? null, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) ?: throw new HAConfigurationException("A valid network.wan_ipv4 is required.");
             $this->wanSubnetV4 = (int)($network['wan_subnet_v4'] ?? 0);
@@ -266,7 +273,7 @@ final class FailoverManager
         if (!$this->isDryRun) {
             copy("/conf/config.xml", $backup_path);
         }
-        $this->structuredLog('config_backup_created', ['path' => $backup_path]);
+        $this->structuredLog('config_backup_created', ['path' => $backup_path], LOG_NOTICE);
         return $backup_path;
     }
 
@@ -294,7 +301,7 @@ final class FailoverManager
      */
     private function handleMasterTransition(): bool
     {
-        $this->structuredLog('master_transition_start');
+        $this->structuredLog('master_transition_start', [], LOG_NOTICE);
         if ($this->isDryRun) return true;
 
         $this->cleanupOldBackups();
@@ -307,7 +314,7 @@ final class FailoverManager
             $configArray['interfaces'][$this->settings->wanInterfaceKey]['ipaddr'] = 'dhcp';
             unset($configArray['interfaces'][$this->settings->wanInterfaceKey]['subnet']);
         } else {
-            if ($this->wanMode === 'static') {
+            if ($this->settings->wanMode === 'static') {
                 $configArray['interfaces'][$this->settings->wanInterfaceKey]['ipaddr'] = $this->settings->wanIpv4;
                 $configArray['interfaces'][$this->settings->wanInterfaceKey]['subnet'] = $this->settings->wanSubnetV4;
             }
@@ -317,7 +324,9 @@ final class FailoverManager
         if (!empty($this->settings->tunnelInterfaceKey)) {
             $configArray['interfaces'][$this->settings->tunnelInterfaceKey]['enable'] = true;
         }
-
+        if (!empty($this->settings->standbyGatewayIp)) {
+            mwexecfm("/sbin/route -q delete default");
+        }
         try {
             if (!$this->applyConfigurationWithRetry('HA Failover: Activating MASTER state', $configArray)) {
                 $this->structuredLog('config_apply_failed', ['backup_path' => $backup_path], LOG_CRIT);
@@ -334,8 +343,8 @@ final class FailoverManager
         $this->controlServices('restart', $this->settings->standardServices);
 
         if ($this->settings->wanMode === 'dhcp') {
-            $this->structuredLog('dhcp_lease_wait', ['delay' => 15]);
-            sleep(15);
+            $this->structuredLog('dhcp_lease_wait', ['delay' => 3], LOG_NOTICE);
+            sleep(3);
         }
 
         if (!$this->healthCheckWithRetries()) {
@@ -353,13 +362,19 @@ final class FailoverManager
      */
     private function handleBackupTransition(): bool
     {
-        $this->structuredLog('backup_transition_start');
+        $this->structuredLog('backup_transition_start',[], LOG_NOTICE);
         if ($this->isDryRun) return true;
 
         $this->controlServices('stop', $this->settings->standardServices);
         $this->controlServices('stop', $this->settings->coreServices);
 
+        $this->config->forceReload();
+        $configArray = $this->config->toArray(listtags());
+        $device = $configArray['interfaces'][$this->settings->wanInterfaceKey]['if'];
+
         killbypid("/var/run/dpinger_{$this->settings->wanGatewayName}.pid");
+        killbypid("/var/run/dhclient-.{$device}.pid");
+        killbypid("/var/run/dhclient.{$device}.pid");
 
         $this->config->forceReload();
         $configArray = $this->config->toArray(listtags());
@@ -371,6 +386,11 @@ final class FailoverManager
         }
 
         if (!$this->applyConfigurationWithRetry('HA Failover: Deactivating to BACKUP state', $configArray)) return false;
+
+        if (!empty($this->settings->standbyGatewayIp)) {
+            mwexecfm("/sbin/route -q delete default");
+            mwexecfm("/sbin/route -q add default {$this->settings->standbyGatewayIp}");
+}
 
         $this->structuredLog('backup_transition_complete', [], LOG_NOTICE);
         return true;
@@ -400,7 +420,7 @@ final class FailoverManager
             }
 
             $delay = min($baseDelay * pow(2, $attempt - 1), 30);
-            $this->structuredLog('config_apply_retry', ['attempt' => $attempt, 'delay' => $delay]);
+            $this->structuredLog('config_apply_retry', ['attempt' => $attempt, 'delay' => $delay], LOG_NOTICE);
             if (!$this->isDryRun) sleep($delay);
         }
         $this->structuredLog('config_apply_failed_all_retries', ['max_retries' => $maxRetries], LOG_ERR);
@@ -420,15 +440,30 @@ final class FailoverManager
         $this->config->lock();
         try {
             $this->config->fromArray($configArray);
-            if (write_config($description) === false) {
-                $last_error = Config::getInstance()->getLastError();
-                throw new HAConfigurationException("Failed to write config: " . ($last_error ?? 'Unknown error'));
-            }
+            $this->config->save();
+        } catch (\Exception $e) {
+            throw new HAConfigurationException("Failed to save config: " . $e->getMessage());
         } finally {
             $this->config->unlock();
         }
+        
+        global $config;
+        $config = parse_config();   // force reload from disk into the legacy global
+
         try {
-            $this->backend->configdRun("interface all reconfigure");
+            #$this->backend->configdRun("interface all reconfigure");
+            $ifcfg = $configArray['interfaces'][$this->settings->wanInterfaceKey];
+            $shouldBeUp = !empty($configArray['interfaces'][$this->settings->wanInterfaceKey]['enable']);
+            
+            interface_reset($this->settings->wanInterfaceKey, false, false);
+            if ($shouldBeUp) {
+                interface_configure(false, $this->settings->wanInterfaceKey, true);
+                $this->structuredLog('ran shouldBeUp',['if' => $this->settings->wanInterfaceKey],LOG_NOTICE);
+            }
+            else {
+                #interface_configure(false, $this->settings->wanInterfaceKey, false);
+                $this->structuredLog('ran shouldBeDown',['if' => $this->settings->wanInterfaceKey],LOG_NOTICE);
+            }
         } catch (\Exception $e) {
             throw new HANetworkException("Error during interface reconfigure: " . $e->getMessage());
         }
@@ -477,11 +512,17 @@ final class FailoverManager
      */
     private function controlServices(string $action, array $services): void
     {
-        $this->structuredLog('service_control_start', ['action' => $action, 'service_count' => count($services)]);
+        $this->structuredLog('service_control_start', ['action' => $action, 'service_count' => count($services)], LOG_NOTICE);
         foreach ($services as $service) {
             if (empty($service['name'])) continue;
             try {
-                $this->backend->configdRun("service {$action} " . escapeshellarg($service['name']));
+                #$this->backend->configdRun("service {$action} " . escapeshellarg($service['name']));
+                if ($service['name'] === 'kea') {
+                    // Kea's configd action doesn't follow the generic "service <action> <name>" pattern
+                    $this->backend->configdRun("kea {$action}");
+                } else {
+                    $this->backend->configdRun("service {$action} " . escapeshellarg($service['name']));
+                }
 
                 $shouldBeRunning = in_array($action, ['start', 'restart']);
                 if (!$this->verifyServiceState($service['name'], $shouldBeRunning)) {
@@ -506,7 +547,7 @@ final class FailoverManager
                 return true;
             }
             if ($i < $this->settings->healthCheckRetries) {
-                $this->structuredLog('health_check_retry', ['attempt' => $i, 'delay' => $this->settings->healthCheckRetryDelay]);
+                $this->structuredLog('health_check_retry', ['attempt' => $i, 'delay' => $this->settings->healthCheckRetryDelay], LOG_NOTICE);
                 sleep($this->settings->healthCheckRetryDelay);
             }
         }
@@ -588,7 +629,7 @@ final class FailoverManager
     private function initializeState(): array
     {
         $status = $this->getCurrentSystemCarpStatus();
-        $this->structuredLog('state_file_init', ['initial_status' => $status->value]);
+        $this->structuredLog('state_file_init', ['initial_status' => $status->value], LOG_NOTICE);
         $this->writeStateFile($status);
         return [$status, time()];
     }
@@ -687,7 +728,7 @@ final class FailoverManager
     private function resetFailureCount(): void
     {
         if (file_exists(self::FAILURE_STATE_FILE)) {
-            $this->structuredLog('failover_failure_reset');
+            $this->structuredLog('failover_failure_reset', [], LOG_NOTICE);
             @unlink(self::FAILURE_STATE_FILE);
         }
     }

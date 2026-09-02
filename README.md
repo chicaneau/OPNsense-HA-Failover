@@ -58,6 +58,7 @@ Before installing the scripts, configure your firewalls:
 1. Configure HA Sync settings pointing to primary firewall
 2. Go to **System → High Availability → Settings**
    - Check "Disable Preemptive Mode"
+3. Optionally set the standby_gateway_ip to the ip of your primary router, so that the secondary has internet (for updates mostly) while the primary is up
 
 #### Both Firewalls
 
@@ -123,7 +124,8 @@ Edit `/usr/local/etc/ha_failover.conf` for your environment:
 {
   "interfaces": {
     "wan_key": "wan",
-    "tunnel_key": "opt1"
+    "tunnel_key": "opt1",
+    "standby_gateway_ip": "10.0.0.1"
   },
   "network": {
     "wan_mode": "static",
